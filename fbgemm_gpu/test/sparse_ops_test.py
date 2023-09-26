@@ -26,17 +26,12 @@ try:
     from fbgemm_gpu import open_source  # noqa: F401
 
     # pyre-ignore[21]
-    from test_utils import gpu_available, gpu_unavailable, running_on_github, skipIfRocm
+    from test_utils import gpu_available, gpu_unavailable, skipIfRocm
 except Exception:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_cpu")
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu/codegen:index_select_ops")
-    from fbgemm_gpu.test.test_utils import (
-        gpu_available,
-        gpu_unavailable,
-        running_on_github,
-        skipIfRocm,
-    )
+    from fbgemm_gpu.test.test_utils import gpu_available, gpu_unavailable, skipIfRocm
 
 
 def unbucketize_indices_value(
@@ -843,6 +838,93 @@ class SparseOpsTest(unittest.TestCase):
                 torch.testing.assert_close(
                     unbucketized_indices, indices, rtol=0, atol=0
                 )
+
+    @given(
+        index_type=st.sampled_from([torch.int, torch.long]),
+        has_weight=st.booleans(),
+        bucketize_pos=st.booleans(),
+        sequence=st.booleans(),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=16, deadline=None)
+    def test_block_bucketize_sparse_features_with_variable_batch_sizes(
+        self,
+        index_type: Optional[torch.dtype],
+        has_weight: bool,
+        bucketize_pos: bool,
+        sequence: bool,
+    ) -> None:
+        lengths = torch.tensor([2, 1, 1, 2, 0, 2], dtype=index_type)
+        indices = torch.tensor(
+            [1, 8, 5, 6, 7, 8, 8, 4],
+            dtype=index_type,
+        )
+        batch_sizes = torch.tensor([3, 1, 2], dtype=index_type)
+        weights = (
+            torch.tensor(
+                [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                dtype=torch.float,
+            )
+            if has_weight
+            else None
+        )
+
+        block_sizes = torch.tensor([5, 10, 8], dtype=index_type)
+        my_size = 2
+        max_B = batch_sizes.max().item()
+
+        new_lengths_ref = torch.tensor(
+            [1, 0, 0, 2, 0, 1, 1, 1, 1, 0, 0, 1],
+            dtype=index_type,
+        )
+        new_indices_ref = torch.tensor(
+            [1, 7, 8, 4, 3, 0, 1, 0],
+            dtype=index_type,
+        )
+
+        (
+            new_lengths_cpu,
+            new_indices_cpu,
+            new_weights_cpu,
+            new_pos_cpu,
+            unbucketize_permute,
+        ) = torch.ops.fbgemm.block_bucketize_sparse_features(
+            lengths,
+            indices,
+            bucketize_pos,
+            sequence,
+            block_sizes,
+            my_size,
+            weights,
+            batch_sizes,
+        )
+        torch.testing.assert_close(new_lengths_cpu, new_lengths_ref, rtol=0, atol=0)
+        torch.testing.assert_close(new_indices_cpu, new_indices_ref, rtol=0, atol=0)
+
+        if gpu_available:
+            (
+                new_lengths_gpu,
+                new_indices_gpu,
+                new_weights_gpu,
+                new_pos_gpu,
+                unbucketize_permute_gpu,
+            ) = torch.ops.fbgemm.block_bucketize_sparse_features(
+                lengths.cuda(),
+                indices.cuda(),
+                bucketize_pos,
+                sequence,
+                block_sizes.cuda(),
+                my_size,
+                weights.cuda() if weights is not None else None,
+                batch_sizes.cuda(),
+                max_B,
+            )
+
+            torch.testing.assert_close(
+                new_lengths_gpu.cpu(), new_lengths_ref, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                new_indices_gpu.cpu(), new_indices_ref, rtol=0, atol=0
+            )
 
     @given(
         index_type=st.sampled_from([torch.int, torch.long]),
@@ -1738,7 +1820,6 @@ class SparseOpsTest(unittest.TestCase):
         ),
         torch_compile=st.booleans(),
     )
-    @unittest.skipIf(*running_on_github)
     @settings(deadline=None)
     def test_pack_segments(
         self,
